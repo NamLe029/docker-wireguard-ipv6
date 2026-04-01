@@ -29,6 +29,7 @@ RUN \
     net-tools \
     nftables \
     openresolv \
+    python3 \
     wireguard-tools==${WIREGUARD_RELEASE} && \
   echo "wireguard" >> /etc/modules && \
   sed -i 's|\[\[ $proto == -4 \]\] && cmd sysctl -q net\.ipv4\.conf\.all\.src_valid_mark=1|[[ $proto == -4 ]] \&\& [[ $(sysctl -n net.ipv4.conf.all.src_valid_mark) != 1 ]] \&\& cmd sysctl -q net.ipv4.conf.all.src_valid_mark=1|' /usr/bin/wg-quick && \
@@ -41,6 +42,7 @@ RUN \
 
 # add local files
 COPY /root /
+RUN find /etc/s6-overlay/s6-rc.d/ -type f | xargs sed -i 's/\r//'
 
 # ports and volumes
 EXPOSE 51820/udp

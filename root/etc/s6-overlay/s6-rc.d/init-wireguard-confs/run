@@ -23,6 +23,91 @@ if ! grep -q 'PresharedKey' /config/templates/peer.conf; then
     sed -i 's|^Endpoint|PresharedKey = \$\(cat /config/\${PEER_ID}/presharedkey-\${PEER_ID}\)\nEndpoint|' /config/templates/peer.conf
 fi
 
+ip_version () {
+    if [[ "$1" =~ : ]]; then
+        echo 6
+    else
+        echo 4
+    fi
+    
+}
+
+check_range() {
+    local ip="$1"
+    local start=$(echo "$2" | cut -d'-' -f1)
+    local end=$(echo "$2" | cut -d'-' -f2)
+    python3 - <<DUDE
+import ipaddress, sys
+ip = ipaddress.ip_address("$ip")
+start = ipaddress.ip_address("$start")
+end = ipaddress.ip_address("$end")
+sys.exit(0 if start <= ip <= end else 1)
+DUDE
+    return $?
+}
+
+check_ranges () {
+    local ip="$1"
+    local ranges="$2"
+    
+    local version=$(ip_version "$ip")
+    local ranges_array
+    IFS=',' read -r -a ranges_array <<< "$ranges"
+    local r
+    for r in "${ranges_array[@]}"; do
+        if [[ $version -ne $(ip_version "$r") ]]; then
+            continue
+        fi
+        if check_range "$ip" "$r"; then
+            return 0
+        fi
+    done
+    return 1
+}
+
+allocate_ip () {
+    local ranges_array
+    IFS=',' read -r -a ranges_array <<< "$1"
+    local r
+    for r in "${ranges_array[@]}"; do
+        local start=$(echo "$r" | cut -d'-' -f1)
+        local end=$(echo "$r" | cut -d'-' -f2)
+        local allocated_ip=$(python3 - <<DUDE
+import ipaddress, glob, sys
+start = ipaddress.ip_address("$start")
+end = ipaddress.ip_address("$end")
+ip = start
+while ip <= end:
+    if str(ip) not in ("$2"):
+        print(str(ip))
+        sys.exit(0)
+    ip += 1
+sys.exit(1)
+DUDE
+)
+        if [[ $? -eq 0 ]]; then
+            echo "$allocated_ip"
+            return 0
+        fi
+    done
+    echo "NONE"
+}
+
+extract_ranges_v() {
+    local ranges_array
+    IFS=',' read -r -a ranges_array <<< "$1"
+    local r
+    local result=""
+    for r in "${ranges_array[@]}"; do
+        if [[ $(ip_version "$r") -eq $2 ]]; then
+            result="$result,$r"
+        fi
+    done
+    # trim leading comma
+    result="${result#,}"
+    echo "$result"
+}
+
 generate_confs () {
     mkdir -p /config/server
     if [[ ! -f /config/server/privatekey-server ]]; then
@@ -34,6 +119,25 @@ generate_confs () {
 $(cat /config/templates/server.conf)
 
 DUDE"
+    OCCUPIED_IPS=""
+    for i in "${PEERS_ARRAY[@]}"; do
+        if [[ ! "${i}" =~ ^[[:alnum:]]+$ ]]; then
+            echo "**** Peer ${i} contains non-alphanumeric characters and thus will be skipped. No config for peer ${i} will be generated. ****"
+        else
+            if [[ "${i}" =~ ^[0-9]+$ ]]; then
+                PEER_ID="peer${i}"
+            else
+                PEER_ID="peer_${i}"
+            fi
+            if [[ -f "/config/${PEER_ID}/${PEER_ID}.conf" ]]; then
+                CLIENT_IPS=$(grep "Address" "/config/${PEER_ID}/${PEER_ID}.conf" | awk -F'=' '{print $NF}' | tr -d ' ' | tr -d '\n' | tr -d '\r')
+                OCCUPIED_IPS="$OCCUPIED_IPS,$CLIENT_IPS"
+            fi
+        fi
+    done
+
+    OCCUPIED_IPS="${OCCUPIED_IPS#,}" # trim leading comma
+
     for i in "${PEERS_ARRAY[@]}"; do
         if [[ ! "${i}" =~ ^[[:alnum:]]+$ ]]; then
             echo "**** Peer ${i} contains non-alphanumeric characters and thus will be skipped. No config for peer ${i} will be generated. ****"
@@ -50,18 +154,49 @@ DUDE"
                 wg genpsk > "/config/${PEER_ID}/presharedkey-${PEER_ID}"
             fi
             if [[ -f "/config/${PEER_ID}/${PEER_ID}.conf" ]]; then
-                CLIENT_IP=$(grep "Address" "/config/${PEER_ID}/${PEER_ID}.conf" | awk '{print $NF}')
-                if [[ -n "${ORIG_INTERFACE}" ]] && [[ "${INTERFACE}" != "${ORIG_INTERFACE}" ]]; then
-                    CLIENT_IP="${CLIENT_IP//${ORIG_INTERFACE}/${INTERFACE}}"
-                fi
-            else
-                for idx in {2..254}; do
-                PROPOSED_IP="${INTERFACE}.${idx}"
-                if ! grep -q -R "${PROPOSED_IP}" /config/peer*/*.conf 2>/dev/null && ([[ -z "${ORIG_INTERFACE}" ]] || ! grep -q -R "${ORIG_INTERFACE}.${idx}" /config/peer*/*.conf 2>/dev/null); then
-                    CLIENT_IP="${PROPOSED_IP}"
-                    break
-                fi
+                CLIENT_IPS=$(grep "Address" "/config/${PEER_ID}/${PEER_ID}.conf" | awk -F'=' '{print $NF}' | tr -d ' ' | tr -d '\n' | tr -d '\r')
+                CLIENT_IP=""
+                IFS=',' read -r -a ip_array <<< "$CLIENT_IPS"
+
+                local ip
+                for ip in "${ip_array[@]}"; do
+                    if ! check_ranges "$ip" "$ALLOCATED_RANGES"; then
+                        echo "**** Client IP $ip for peer ${PEER_ID} is out of the allocated range $ALLOCATED_RANGES, allocating a new IP. ****"
+
+                        ip=$(allocate_ip $(extract_ranges_v "$ALLOCATED_RANGES" $(ip_version "$ip")) "$OCCUPIED_IPS")
+                        if [[ "$ip" = "NONE" ]]; then
+                            echo "**** No available IPs in the allocated range $ALLOCATED_RANGES for peer ${PEER_ID}. Please expand the allocated range or remove some peers. ****"
+                            exit 1
+                        fi
+                    fi
+                    OCCUPIED_IPS="$OCCUPIED_IPS,$ip"
+                    CLIENT_IP="$CLIENT_IP,$ip"
                 done
+                # trim leading comma
+                CLIENT_IP="${CLIENT_IP#,}"
+                # add space after each comma
+                CLIENT_IP="${CLIENT_IP//,/, }"
+            else
+                # Check if there are ipv4 or ipv6 addresses in the allocated range and allocate accordingly
+                CLIENT_IP=""
+                if [[ $(extract_ranges_v "$ALLOCATED_RANGES" 4) ]]; then
+                    CLIENT_IP=$(allocate_ip $(extract_ranges_v "$ALLOCATED_RANGES" 4) "$OCCUPIED_IPS")
+                    OCCUPIED_IPS="$OCCUPIED_IPS,$CLIENT_IP"
+                fi
+                if [[ $(extract_ranges_v "$ALLOCATED_RANGES" 6) ]]; then
+                    CLIENT_IP="$CLIENT_IP,$(allocate_ip $(extract_ranges_v "$ALLOCATED_RANGES" 6) "$OCCUPIED_IPS")"
+                    OCCUPIED_IPS="$OCCUPIED_IPS,$CLIENT_IP"
+                fi
+
+                if [[ $CLIENT_IP == *NONE* ]]; then
+                    echo "**** No available IPs in the allocated range $ALLOCATED_RANGES for peer ${PEER_ID}. Please expand the allocated range or remove some peers. ****"
+                    exit 1
+                fi
+
+                # trim leading comma
+                CLIENT_IP="${CLIENT_IP#,}"
+                # add space after each comma
+                CLIENT_IP="${CLIENT_IP//,/, }"
             fi
             if [[ -f "/config/${PEER_ID}/presharedkey-${PEER_ID}" ]]; then
                 # create peer conf with presharedkey
@@ -91,15 +226,28 @@ PublicKey = $(cat "/config/${PEER_ID}/publickey-${PEER_ID}")
 DUDE
             fi
             SERVER_ALLOWEDIPS=SERVER_ALLOWEDIPS_PEER_${i}
+            local ip_list
+            IFS=',' read -r -a ip_list <<< "${CLIENT_IP//, /,}"
+            local ip
+            PALLOWEDIPS=""
+            for ip in "${ip_list[@]}"; do
+                if [[ $(ip_version "$ip") -eq 4 ]]; then
+                    PALLOWEDIPS="${PALLOWEDIPS},${ip}/32"
+                else
+                    PALLOWEDIPS="${PALLOWEDIPS},${ip}/128"
+                fi
+            done
+            PALLOWEDIPS="${PALLOWEDIPS#,}" # trim leading comma
+            PALLOWEDIPS="${PALLOWEDIPS//,/, }" # add space after each comma
             # add peer's allowedips to server conf
             if [[ -n "${!SERVER_ALLOWEDIPS}" ]]; then
                 echo "Adding ${!SERVER_ALLOWEDIPS} to wg0.conf's AllowedIPs for peer ${i}"
                 cat <<DUDE >> /config/wg_confs/wg0.conf
-AllowedIPs = ${CLIENT_IP}/32,${!SERVER_ALLOWEDIPS}
+AllowedIPs = ${PALLOWEDIPS}, ${!SERVER_ALLOWEDIPS}
 DUDE
             else
                 cat <<DUDE >> /config/wg_confs/wg0.conf
-AllowedIPs = ${CLIENT_IP}/32
+AllowedIPs = ${PALLOWEDIPS}
 DUDE
             fi
             # add PersistentKeepalive if the peer is specified
@@ -130,7 +278,8 @@ ORIG_SERVERURL="$SERVERURL"
 ORIG_SERVERPORT="$SERVERPORT"
 ORIG_PEERDNS="$PEERDNS"
 ORIG_PEERS="$PEERS"
-ORIG_INTERFACE="$INTERFACE"
+ORIG_ALLOCATED_RANGES="$ALLOCATED_RANGES"
+ORIG_SERVER_INTERNAL_IP="$SERVER_INTERNAL_IP"
 ORIG_ALLOWEDIPS="$ALLOWEDIPS"
 ORIG_PERSISTENTKEEPALIVE_PEERS="$PERSISTENTKEEPALIVE_PEERS"
 DUDE
@@ -155,14 +304,15 @@ if [[ -n "$PEERS" ]]; then
     fi
     SERVERPORT=${SERVERPORT:-51820}
     echo "**** External server port is set to ${SERVERPORT}. Make sure that port is properly forwarded to port 51820 inside this container ****"
-    INTERNAL_SUBNET=${INTERNAL_SUBNET:-10.13.13.0}
-    echo "**** Internal subnet is set to $INTERNAL_SUBNET ****"
-    INTERFACE=$(echo "$INTERNAL_SUBNET" | awk 'BEGIN{FS=OFS="."} NF--')
+    echo "**** Server internal IP is set to ${SERVER_INTERNAL_IP} ****"
+    ALLOCATED_RANGES=${ALLOCATED_RANGES:-10.13.13.3-10.13.13.255, fd42:42:42::3-fd42:42:42::ffff} # change default
+    ALLOCATED_RANGES=${ALLOCATED_RANGES// /} # remove spaces just in case
+    echo "**** Allocated ranges are set to $ALLOCATED_RANGES ****"
     ALLOWEDIPS=${ALLOWEDIPS:-0.0.0.0/0, ::/0}
     echo "**** AllowedIPs for peers $ALLOWEDIPS ****"
     if [[ -z "$PEERDNS" ]] || [[ "$PEERDNS" = "auto" ]]; then
-        PEERDNS="${INTERFACE}.1"
-        echo "**** PEERDNS var is either not set or is set to \"auto\", setting peer DNS to ${INTERFACE}.1 to use wireguard docker host's DNS. ****"
+        PEERDNS="${SERVER_INTERNAL_IP}"
+        echo "**** PEERDNS var is either not set or is set to \"auto\", setting peer DNS to ${SERVER_INTERNAL_IP} to use wireguard docker host's DNS. ****"
     else
         echo "**** Peer DNS servers will be set to $PEERDNS ****"
     fi
@@ -175,7 +325,7 @@ if [[ -n "$PEERS" ]]; then
         if [[ -f /config/.donoteditthisfile ]]; then
             . /config/.donoteditthisfile
         fi
-        if [[ "$SERVERURL" != "$ORIG_SERVERURL" ]] || [[ "$SERVERPORT" != "$ORIG_SERVERPORT" ]] || [[ "$PEERDNS" != "$ORIG_PEERDNS" ]] || [[ "$PEERS" != "$ORIG_PEERS" ]] || [[ "$INTERFACE" != "$ORIG_INTERFACE" ]] || [[ "$ALLOWEDIPS" != "$ORIG_ALLOWEDIPS" ]] || [[ "$PERSISTENTKEEPALIVE_PEERS" != "$ORIG_PERSISTENTKEEPALIVE_PEERS" ]]; then
+        if [[ "$SERVERURL" != "$ORIG_SERVERURL" ]] || [[ "$SERVERPORT" != "$ORIG_SERVERPORT" ]] || [[ "$PEERDNS" != "$ORIG_PEERDNS" ]] || [[ "$PEERS" != "$ORIG_PEERS" ]] || [[ "$ALLOCATED_RANGES" != "$ORIG_ALLOCATED_RANGES" ]] || [[ "$ALLOWEDIPS" != "$ORIG_ALLOWEDIPS" ]] || [[ "$PERSISTENTKEEPALIVE_PEERS" != "$ORIG_PERSISTENTKEEPALIVE_PEERS" ]] || [[ "$SERVER_INTERNAL_IP" != "$ORIG_SERVER_INTERNAL_IP" ]]; then
             echo "**** Server related environment variables changed, regenerating 1 server and ${PEERS} peer/client confs ****"
             generate_confs
             save_vars
