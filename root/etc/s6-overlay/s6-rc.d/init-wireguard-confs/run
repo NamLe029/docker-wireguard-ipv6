@@ -26,10 +26,11 @@ fi
 ip_version () {
     if [[ "$1" =~ : ]]; then
         echo 6
-    else
+    elif [[ "$1" =~ \. ]]; then
         echo 4
+    else
+        echo 0
     fi
-    
 }
 
 check_range() {
@@ -77,8 +78,9 @@ import ipaddress, glob, sys
 start = ipaddress.ip_address("$start")
 end = ipaddress.ip_address("$end")
 ip = start
+occupied = "$2".split(",") if "$2" else []
 while ip <= end:
-    if str(ip) not in ("$2"):
+    if str(ip) not in occupied:
         print(str(ip))
         sys.exit(0)
     ip += 1
@@ -160,6 +162,11 @@ DUDE"
 
                 local ip
                 for ip in "${ip_array[@]}"; do
+                    if [[ -z $(extract_ranges_v "$ALLOCATED_RANGES" $(ip_version "$ip") ) ]]; then
+                        echo "**** Client IP $ip for peer ${PEER_ID} is removed because the same IP version is not present in the allocated ranges. ****"
+                        ip=""
+                        continue
+                    fi
                     if ! check_ranges "$ip" "$ALLOCATED_RANGES"; then
                         echo "**** Client IP $ip for peer ${PEER_ID} is out of the allocated range $ALLOCATED_RANGES, allocating a new IP. ****"
 
@@ -172,6 +179,26 @@ DUDE"
                     OCCUPIED_IPS="$OCCUPIED_IPS,$ip"
                     CLIENT_IP="$CLIENT_IP,$ip"
                 done
+                if [[ -n $(extract_ranges_v "$ALLOCATED_RANGES" 4) ]] && [[ -z $(extract_ranges_v "$CLIENT_IP" 4) ]]; then
+                    echo "**** IPv4 was added to the allocated ranges, allocating an IPv4 for peer ${PEER_ID}. ****"
+                    ip="$(allocate_ip $(extract_ranges_v "$ALLOCATED_RANGES" 4) "$OCCUPIED_IPS")"
+                    if [[ "$CLIENT_IP" = *NONE* ]]; then
+                        echo "**** No available IPv4s in the allocated range $ALLOCATED_RANGES for peer ${PEER_ID}. Skipping peer. ****"
+                    else
+                        CLIENT_IP="$CLIENT_IP,$ip"
+                        OCCUPIED_IPS="$OCCUPIED_IPS,$ip"
+                    fi
+                fi
+                if [[ -n $(extract_ranges_v "$ALLOCATED_RANGES" 6) ]] && [[ -z $(extract_ranges_v "$CLIENT_IP" 6) ]]; then
+                    echo "**** IPv6 was added to the allocated ranges, allocating an IPv6 for peer ${PEER_ID}. ****"
+                    ip="$(allocate_ip $(extract_ranges_v "$ALLOCATED_RANGES" 6) "$OCCUPIED_IPS")"
+                    if [[ "$CLIENT_IP" = *NONE* ]]; then
+                        echo "**** No available IPv6s in the allocated range $ALLOCATED_RANGES for peer ${PEER_ID}. Skipping peer. ****"
+                    else
+                        CLIENT_IP="$CLIENT_IP,$ip"
+                        OCCUPIED_IPS="$OCCUPIED_IPS,$ip"
+                    fi
+                fi
                 # trim leading comma
                 CLIENT_IP="${CLIENT_IP#,}"
                 # add space after each comma
@@ -179,13 +206,16 @@ DUDE"
             else
                 # Check if there are ipv4 or ipv6 addresses in the allocated range and allocate accordingly
                 CLIENT_IP=""
+                local new_ip
                 if [[ $(extract_ranges_v "$ALLOCATED_RANGES" 4) ]]; then
-                    CLIENT_IP=$(allocate_ip $(extract_ranges_v "$ALLOCATED_RANGES" 4) "$OCCUPIED_IPS")
-                    OCCUPIED_IPS="$OCCUPIED_IPS,$CLIENT_IP"
+                    new_ip=$(allocate_ip $(extract_ranges_v "$ALLOCATED_RANGES" 4) "$OCCUPIED_IPS")
+                    OCCUPIED_IPS="$OCCUPIED_IPS,$new_ip"
+                    CLIENT_IP="$new_ip"
                 fi
                 if [[ $(extract_ranges_v "$ALLOCATED_RANGES" 6) ]]; then
-                    CLIENT_IP="$CLIENT_IP,$(allocate_ip $(extract_ranges_v "$ALLOCATED_RANGES" 6) "$OCCUPIED_IPS")"
-                    OCCUPIED_IPS="$OCCUPIED_IPS,$CLIENT_IP"
+                    new_ip="$(allocate_ip $(extract_ranges_v "$ALLOCATED_RANGES" 6) "$OCCUPIED_IPS")"
+                    OCCUPIED_IPS="$OCCUPIED_IPS,$new_ip"
+                    CLIENT_IP="$CLIENT_IP,$new_ip"
                 fi
 
                 if [[ $CLIENT_IP == *NONE* ]]; then
@@ -228,7 +258,6 @@ DUDE
             SERVER_ALLOWEDIPS=SERVER_ALLOWEDIPS_PEER_${i}
             local ip_list
             IFS=',' read -r -a ip_list <<< "${CLIENT_IP//, /,}"
-            local ip
             PALLOWEDIPS=""
             for ip in "${ip_list[@]}"; do
                 if [[ $(ip_version "$ip") -eq 4 ]]; then
